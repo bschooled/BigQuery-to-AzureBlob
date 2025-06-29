@@ -118,6 +118,23 @@ $bigQueryLsName = ($allLs | Where-Object {
         $_.Properties.Type -match 'BigQuery'
     }).Name
 
+if (-not $bigQueryLsName){
+    $i = 0
+    While (-not $bigQueryLsName -and $i -lt 3) {
+        Write-Host "No BigQuery linked service found." -ForegroundColor Red
+        Write-Host "Please create one in Data Factory first.`n
+        You can follow the instructions in the README to setup, the script will wait for you to complete" -ForegroundColor Yellow
+        $bigQueryLsName = Read-Host "Enter the name of the BigQuery linked service to use"
+        $bigQueryLsName = ($allLs | Where-Object {
+            $_.Properties.Type -match 'BigQuery'
+        }).Name
+        $i++
+    }
+    if (-not $bigQueryLsName) {
+        Write-Host "No BigQuery linked service found after 3 attempts. Exiting." -ForegroundColor Red
+        exit 1
+    }
+}
 if ($bigQueryLsName.Count -gt 1) {
     Write-Host "Multiple BigQuery linked services found" -ForegroundColor Yellow
     $matchBQName = Read-Host "Please specify the BigQuery linked service name to use"
@@ -130,12 +147,31 @@ $blobStorageLsName = ($allLs | Where-Object {
         $_.Properties.Type -match 'AzureBlobStorage'
     }).Name
 
-if ($blobStorageLsName.Count -gt 1) {
+if (-not $blobStorageLsName) {
+    $i = 0
+    While (-not $blobStorageLsName -and $i -lt 3) {
+        Write-Host "No Azure Blob Storage linked service found" -ForegroundColor Red
+        Write-Host "Please create an Azure Blob Storage linked service in Data Factory first.`n
+        You can follow the instructions in the README to setup, the script will wait for you to complete" -ForegroundColor Yellow
+        $blobStorageLsName = Read-Host "Enter the name of the Azure Blob Storage linked service to use"
+        # Find the Azure Blob Storage linked service
+        $blobStorageLsName = ($allLs | Where-Object {
+                $_.Properties.Type -match 'AzureBlobStorage'
+            }).Name
+        $i++
+    }
+    if(-not $blobStorageLsName) {
+        Write-Host "No Azure Blob Storage linked service found after 3 attempts. Exiting." -ForegroundColor Red
+        exit 1
+    }
+}
+elseif ($blobStorageLsName.Count -gt 1) {
     Write-Host "Multiple Azure Blob Storage linked services found" -ForegroundColor Yellow
     $matchBlobName = Read-Host "Please specify the Blob Storage linked service name to use"
     $blobStorageLsName = $matchBlobName
     return
 }
+
 
 Write-Host "Using BigQuery LS:     $bigQueryLsName"
 Write-Host "Using BlobStorage LS:  $blobStorageLsName"
