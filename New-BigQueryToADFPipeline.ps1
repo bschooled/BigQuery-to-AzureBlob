@@ -75,7 +75,7 @@ if(-not $(Test-Path -Path $CSVFile)) {
     Write-Host "CSV file '$CSVFile' does not exist. Please provide a valid path." -ForegroundColor Red
     Write-Host "If running from Cloud Shell, click the 'Upload/Download files' icon to upload your CSV file.`n" -ForegroundColor Yellow
     $CSVFile = Read-Host "Enter the path to your BigQuery tables CSV file"
-}
+} 
 
 $tables = Import-Csv -Path $CSVFile
 
