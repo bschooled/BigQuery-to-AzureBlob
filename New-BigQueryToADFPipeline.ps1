@@ -1,11 +1,5 @@
 # Prereqs:
 #  - Az PowerShell module installed & logged in (Connect-AzAccount)
-#  - gcloud CLI installed & authenticated (gcloud auth application-default login)
-#  - ADF linked services and datasets pre-created:
-#       • BigQueryDataset
-#       • BlobSink_JSON (param: containerName, blobFileName)
-#       • BlobSink_Parquet (param: containerName, blobFileName)
-
 # —— CONFIG —— #
 param(
     [Parameter(Mandatory=$true, HelpMessage="Azure Resource Group name.")]
@@ -20,12 +14,6 @@ param(
     [Parameter(Mandatory=$true, HelpMessage="Azure Data Factory name.")]
     [string]$dataFactory,
 
-    [Parameter(Mandatory=$true, HelpMessage="Google Cloud Project ID.")]
-    [string]$projectId,
-
-    [Parameter(Mandatory=$true, HelpMessage="BigQuery Dataset ID.")]
-    [string]$datasetId,
-
     [Parameter(Mandatory=$true, HelpMessage="Path to CSV file with BigQuery table metadata.")]
     [string]$CSVFile,
 
@@ -33,6 +21,11 @@ param(
     [ValidateSet("json", "parquet")]
     [string]$OutputFormat
 )
+
+if(-not $(Get-Module -Name Az -ErrorAction SilentlyContinue)) {
+    Write-Host "Az module not found. Installing..." -ForegroundColor Yellow
+    Install-Module -Name Az -AllowClobber -Force -SkipPublisherCheck -Scope CurrentUser
+}
 
 if(-not $(Get-AzResourceGroup -Name $rg -ErrorAction SilentlyContinue)) {
     Write-Host "Resource group '$rg' does not exist. Please create it first." -ForegroundColor Red
@@ -84,8 +77,13 @@ $ctx = New-AzStorageContext -StorageAccountName $saName -UseConnectedAccount
 
 $tableList = foreach ($t in $tables) {
     $cname = $t.tableId
-    Write-Host "Creating container: $cname"
-    New-AzStorageContainer -Name $cname -Context $ctx -ErrorAction SilentlyContinue | Out-Null
+    $container = Get-AzStorageContainer -Name $cname -Context $ctx -ErrorAction SilentlyContinue
+    if (-not $container) {
+        Write-Host "Creating container: $cname"
+        New-AzStorageContainer -Name $cname -Context $ctx | Out-Null
+    } else {
+        Write-Host "Container '$cname' already exists." -ForegroundColor Green
+    }
 
     [PSCustomObject]@{
         tableName    = $cname
@@ -172,9 +170,20 @@ foreach ($row in $tableList) {
         }
     }
 
-    # deploy child
+    # Check if child pipeline exists
+    $existingChild = Get-AzDataFactoryV2Pipeline -ResourceGroupName $rg -DataFactoryName $dataFactory -Name $childName -ErrorAction SilentlyContinue
+
     $childObj = ($child | ConvertTo-Json -Depth 100) | ConvertFrom-Json
-    Set-AzDataFactoryV2Pipeline -ResourceGroupName $rg -DataFactoryName $dataFactory -Name $childName -Definition $childObj
+
+    if ($existingChild) {
+        # Update existing pipeline
+        Write-Host "Updating existing pipeline: $childName" -ForegroundColor Yellow
+        Set-AzDataFactoryV2Pipeline -ResourceGroupName $rg -DataFactoryName $dataFactory -Name $childName -Definition $childObj
+    } else {
+        # Create new pipeline
+        Write-Host "Creating new pipeline: $childName" -ForegroundColor Green
+        Set-AzDataFactoryV2Pipeline -ResourceGroupName $rg -DataFactoryName $dataFactory -Name $childName -Definition $childObj
+    }
 
     # add child to parent
     $parent.properties.activities += @{
