@@ -35,3 +35,32 @@ cd .\Bigquery-to-AzureBlob
 ## 3. Upload the CSV to the CloudShell
 
 At the top of the Cloud Shell pane, there is a "Manage Files" option. Select this and choose "Upload File" and choose your exported CSV from step 1.
+
+## 4. Run Powershell script with parameters
+
+Now that we have the required CSV uploaded, you will need to run the script with a number of parameters
+
+You can either run the command like below and replace the text;
+
+```powershell
+.\New-BigQueryToADFPipeline.ps1 -ResourceGroupName "resource_group_name" ` 
+    -StorageAccountName "storage_account_name" `
+    -AzureRegion "Azure_deployment_region" `
+    -DataFactoryName "data_factory_name" `
+    -BQDatasetID "your_BQ_dataset_Name" `
+    -BQProjectID "project_name_containing_dataset" `
+    -OutputFormat "json_or_parquet" `
+    -CSVFile "path_to_exported_tables_csv"
+```
+
+Or use the params.txt and pass it to the powershell script;
+
+```powershell
+$parameters = Get-Content -Path "params.txt"
+.\New-BigQueryToADFPipeline.ps1 @parameters
+```
+
+
+## 5. Setup Linked Services (Optional if existing)
+
+### a. Create Service Account and download key
