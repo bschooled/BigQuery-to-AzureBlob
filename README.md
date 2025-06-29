@@ -2,7 +2,7 @@
 
 Use Azure Data Factory to export and sink BigQuery Tables to Azure Blob
 
-## Export table data from CSV and save as JSON
+## 1. Export table data from CSV and save as JSON
 
 Use this example query to generate each table name, creation/updated timestamp, and table size. This will be used later by the script to create the Azure Data Factory datasets and pipelines. Make sure to update your project name and dataset name first.
 
@@ -16,3 +16,22 @@ SELECT
 FROM `my_project_name.my_dataset_name.__TABLES__`
 ORDER BY last_modified_timestamp DESC;
 ```
+
+After successfully running the query use BigQuery "Save Results" -> CSV(Local File) option. You will need this later.
+
+## 2. Cloning Repo into Azure Cloud Shell
+
+This script was designed to be easily executed directly from Azure Cloud Shell.
+
+From portal.azure.com in the top bar, to the right of the search bar find the cloud shell icon and select to open a cloud shell. If it prompts you for an Azure Storage Account for persistent storage you can skip this step and use ephemeral instead.
+
+Now that we have the Cloud Shell opened, you will first need to clone the repository:
+
+```powershell
+git clone https://github.com/bschooled/BigQuery-to-AzureBlob.git
+cd .\Bigquery-to-AzureBlob
+```
+
+## 3. Upload the CSV to the CloudShell
+
+At the top of the Cloud Shell pane, there is a "Manage Files" option. Select this and choose "Upload File" and choose your exported CSV from step 1.
