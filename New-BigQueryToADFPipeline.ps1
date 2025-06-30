@@ -109,9 +109,22 @@ $tableList = foreach ($t in $tables) {
 #   • GoogleBigQueryLinkedService
 #   • AzureBlobStorageLinkedService
 # 4) CREATE LINKED SERVICES
+
+# setup the Azure Blob Storage linked service
+$adf = Get-AzDataFactoryV2 -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName
+$adfIdentity = $adf.Identity.PrincipalId
+
+# Assign Storage Blob Data Contributor role
+New-AzRoleAssignment `
+  -ObjectId $adfIdentity `
+  -RoleDefinitionName "Storage Blob Data Contributor" `
+  -Scope "/subscriptions/$((Get-AzContext).Subscription.Id)/resourceGroups/$ResourceGroupName/providers/Microsoft.Storage/storageAccounts/$StorageAccountName"
+
+
+
 $allLs = Get-AzDataFactoryV2LinkedService `
-    -ResourceGroupName $rg `
-    -DataFactoryName    $dataFactory
+    -ResourceGroupName $ResourceGroupName `
+    -DataFactoryName    $DataFactoryName
 
 # Find the BigQuery linked service (type: GoogleBigQueryV2 or GoogleBigQuery)
 $bigQueryLsName = ($allLs | Where-Object {
@@ -135,7 +148,7 @@ if (-not $bigQueryLsName){
         exit 1
     }
 }
-if ($bigQueryLsName.Count -gt 1) {
+elseif ($bigQueryLsName.Count -gt 1) {
     Write-Host "Multiple BigQuery linked services found" -ForegroundColor Yellow
     $matchBQName = Read-Host "Please specify the BigQuery linked service name to use"
     $bigQueryLsName = $matchBQName

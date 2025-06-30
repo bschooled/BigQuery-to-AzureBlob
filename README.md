@@ -64,7 +64,7 @@ $parameters = Get-Content -Path "params.txt"
 
 If you received a message from the script that it could not find a linked service for either Blob or BigQuery you will need to take additional steps to continue.
 
-### a. BigQuery Link Service Missing: Create Service Account in GCP and download key
+### BigQuery Link Service Missing: Create Service Account in GCP and download key
 
 From the Google Cloud Console, open a cloud shell.
 
@@ -101,7 +101,7 @@ Once opened you will need to run the following commands.
 
   From the Cloud Shell panel, click the three dots next to session information and select "Download File". In the path add key.json to the end. Make sure to only keep this key locally until after we have successfully uploaded to the linked service and then delete it.
 
-#### Create Linked Service in Data Factory Studio.
+#### Create Linked Service in Data Factory Studio
 
     1. From portal.azure.com search "Data Factories" and open.
     2. Choose the Data Factory name that was created by the script (or a prior created one you specified)
@@ -109,9 +109,49 @@ Once opened you will need to run the following commands.
     4. In the left side panel, click "Manage"
     5. In the new flyout panel, click "Linked Services", and then click "New".
     6. In the search panel, search "BigQuery" and select "Google BigQuery" and continue.
-    7. Name the linked service and note the name as you will need to input.
+    7. Name the linked service and note the name as you will need to input this in the script.
     8. You will need to input your Google Project ID, change "Authentication Type" to "Service Authentication" and upload the key.json you created earlier. 
     9. Once done click "Create".
     10. To validate, click the newly created Linked Service, and in the bottom right select "Test Connection". Ensure the connection is successful before continuing.
 
-### b. Azure Storage Linked Service Missing
+### Azure Storage Linked Service Missing
+
+Note that the script will automatically try to create this linked service for you. If for some reason it fails then here are the manual instructions.
+
+#### Assign IAM permissions to System-managed Identity
+
+Open a new portal.azure.com tab, and open Cloud shell (powershell)
+
+Get the system-managed identity
+
+```powershell
+$rg = "your_rg_name"
+$adfName = "your_data_factory_name"
+$saName = "your_storage_account_name"
+
+$adf = Get-AzDataFactoryV2 -ResourceGroupName $rg -DataFactoryName $adfName
+$adfIdentity = $adf.Identity.PrincipalId
+```
+
+Assign the permissions
+
+```powershell
+New-AzRoleAssignment `
+  -ObjectId $adfIdentity `
+  -RoleDefinitionName "Storage Blob Data Contributor" `
+  -Scope "/subscriptions/$((Get-AzContext).Subscription.Id)/resourceGroups/$rg/providers/Microsoft.Storage/storageAccounts/$saName"
+```
+
+#### Create the linked service
+
+    1. From portal.azure.com search "Data Factories" and open.
+    2. Choose the Data Factory name that was created by the script (or a prior created one you specified)
+    3. In the Overview panel, click "Launch Studio"
+    4. In the left side panel, click "Manage"
+    5. In the new flyout panel, click "Linked Services", and then click "New".
+    6. In the search panel, search "Blob" and select "Azure Blob Storage" and continue.
+    7. Name the linked service and note the name as you will need to input this in the script.
+    8. Change authentication type to "System-assigned managed identity"
+    9. Select your Azure Subscription and Storage account name from the drop downs.
+    10. Choose create.
+    11. Open the newly created linked service and select Test Connection before proceeding
