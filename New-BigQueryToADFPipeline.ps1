@@ -28,63 +28,107 @@ param(
     [string]$BQProjectID
 )
 
+# Ensure Az PowerShell module is installed
 if (-not $(Get-Module -Name Az -ErrorAction SilentlyContinue)) {
     Write-Host "Az module not found. Installing..." -ForegroundColor Yellow
     Install-Module -Name Az -AllowClobber -Force -SkipPublisherCheck -Scope CurrentUser
 }
 
+# Ensure Az powerhsell module is authenticated
+if (-not $(Get-AzContext -ErrorAction SilentlyContinue)) {
+    Write-Host "You are not logged in to Azure. Please log in using Connect-AzAccount." -ForegroundColor Red
+    Connect-AzAccount -UseDeviceAuthentication
+}
+
+# Check if resource group exists, if not create it
 if (-not $(Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
     Write-Host "Resource group '$ResourceGroupName' does not exist. Please create it first." -ForegroundColor Red
     # 1) CREATE RESOURCE GROUP
     New-AzResourceGroup -Name $ResourceGroupName -Location $AzureRegion -Force
 }
 
+# Check if storage account exists, if not create it
 if (-not $(Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName -ErrorAction SilentlyContinue)) {
     Write-Host "Storage account '$StorageAccountName' does not exist. Creating it now..." -ForegroundColor Yellow
-    New-AzStorageAccount `
-        -ResourceGroupName $ResourceGroupName `
-        -Name $StorageAccountName `
-        -Location $AzureRegion `
-        -SkuName Standard_LRS `
-        -Kind StorageV2 `
-        -EnableHttpsTrafficOnly $true
 
-    # Deny all networks except trusted Azure services (Bypass=AzureServices)
-    Update-AzStorageAccountNetworkRuleSet `
-        -ResourceGroupName $ResourceGroupName `
-        -Name $StorageAccountName `
-        -DefaultAction Deny `
-        -Bypass AzureServices
+    try {
+        New-AzStorageAccount `
+            -ResourceGroupName $ResourceGroupName `
+            -Name $StorageAccountName `
+            -Location $AzureRegion `
+            -SkuName Standard_LRS `
+            -Kind StorageV2 `
+            -EnableHttpsTrafficOnly $true
+
+        # Deny all networks except trusted Azure services (Bypass=AzureServices)
+        Update-AzStorageAccountNetworkRuleSet `
+            -ResourceGroupName $ResourceGroupName `
+            -Name $StorageAccountName `
+            -DefaultAction Deny `
+            -Bypass AzureServices
+    }
+    catch {
+        Write-Host "An error occurred while creating the storage account: $_" -ForegroundColor Red
+        exit 1
+    }
+
 }
 else {
     Write-Host "Storage account '$StorageAccountName' already exists." -ForegroundColor Green
+    try {
+        # Deny all networks except trusted Azure services (Bypass=AzureServices)
+        Update-AzStorageAccountNetworkRuleSet `
+            -ResourceGroupName $ResourceGroupName `
+            -Name $StorageAccountName `
+            -DefaultAction Deny `
+            -Bypass AzureServices
+    }
+    catch {
+        Write-Host "An error occurred while updating the storage account network rules: $_" -ForegroundColor Red
+        exit 1
+    }
 }
 
 if (-not $(Get-AzDataFactoryV2 -ResourceGroupName $ResourceGroupName -Name $DataFactoryName -ErrorAction SilentlyContinue)) {
     Write-Host "Data Factory '$DataFactoryName' does not exist. Creating it now..." -ForegroundColor Yellow
-    New-AzDataFactoryV2 `
-        -ResourceGroupName $ResourceGroupName `
-        -Name $DataFactoryName `
-        -Location $AzureRegion `
-        -IdentityType SystemAssigned
+
+    try {
+        New-AzDataFactoryV2 `
+            -ResourceGroupName $ResourceGroupName `
+            -Name $DataFactoryName `
+            -Location $AzureRegion `
+            -IdentityType SystemAssigned
+    }
+    catch {
+        Write-Host "An error occurred while creating the Data Factory: $_" -ForegroundColor Red
+        exit 1
+    }
 }
 else {
-    Write-Host "Data Factory '$DataFactoryName' already exists." -ForegroundColor Green
+    Write-Host "Data Factory '$DataFactoryName' already exists, ensuring managed identity is set up..." -ForegroundColor 
+    Set-AzDataFactoryV2 `
+        -ResourceGroupName $ResourceGroupName `
+        -Name $DataFactoryName `
+        -IdentityType SystemAssigned
 }
 
 if (-not $(Test-Path -Path $CSVFile)) {
     Write-Host "CSV file '$CSVFile' does not exist. Please provide a valid path." -ForegroundColor Red
     Write-Host "If running from Cloud Shell, click the 'Upload/Download files' icon to upload your CSV file.`n" -ForegroundColor Yellow
     $CSVFile = Read-Host "Enter the path to your BigQuery tables CSV file"
-} 
+}
 
 $tables = Import-Csv -Path $CSVFile
+if (-not $tables.table_Id) {
+    Write-Host "CSV file does not contain 'table_Id' column. Please ensure the CSV is formatted correctly." -ForegroundColor Red
+    exit 1
+}
 
 # 3) CREATE CONTAINERS per table 📦 using Entra ID authentication
 $ctx = New-AzStorageContext -StorageAccountName $StorageAccountName -UseConnectedAccount
 
 $tableList = foreach ($t in $tables) {
-    $cname = $t.tableId
+    $cname = $t.table_Id
     $container = Get-AzStorageContainer -Name $cname -Context $ctx -ErrorAction SilentlyContinue
     if (-not $container) {
         Write-Host "Creating container: $cname"
