@@ -101,7 +101,7 @@ gcloud iam service-accounts keys create key.json \
 
 From the Cloud Shell panel, click the three dots next to session information and select "Download File". In the path add key.json to the end. Make sure to only keep this key locally until after we have successfully uploaded to the linked service and then delete it.
 
-5. Create Linked Service in Data Factory Studio.
+#### Create Linked Service in Data Factory Studio.
 
   1. From portal.azure.com search "Data Factories" and open.
   2. Choose the Data Factory name that was created by the script (or a prior created one you specified)
