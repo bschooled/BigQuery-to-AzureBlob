@@ -38,6 +38,10 @@ if (-not $(Get-Module -Name Az -ErrorAction SilentlyContinue)) {
 if (-not $(Get-AzContext -ErrorAction SilentlyContinue)) {
     Write-Host "You are not logged in to Azure. Please log in using Connect-AzAccount." -ForegroundColor Red
     Connect-AzAccount -UseDeviceAuthentication
+    if (-not $(Get-AzContext -ErrorAction SilentlyContinue)) {
+        Write-Host "Failed to authenticate. Please check your Azure credentials." -ForegroundColor Red
+        exit 1
+    }
 }
 
 # Check if resource group exists, if not create it
@@ -132,7 +136,14 @@ $tableList = foreach ($t in $tables) {
     $container = Get-AzStorageContainer -Name $cname -Context $ctx -ErrorAction SilentlyContinue
     if (-not $container) {
         Write-Host "Creating container: $cname"
-        New-AzStorageContainer -Name $cname -Context $ctx | Out-Null
+        try {
+            New-AzStorageContainer -Name $cname -Context $ctx | Out-Null
+            Write-Host "Container '$cname' created successfully." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "An error occurred while creating the storage container: $_" -ForegroundColor Red
+            exit 1
+        }
     }
     else {
         Write-Host "Container '$cname' already exists." -ForegroundColor Green
@@ -142,7 +153,7 @@ $tableList = foreach ($t in $tables) {
         tableName     = $cname
         bqDatasetId   = $BQDatasetID
         containerName = $cname
-        blobFileName  = "$cname"                  # file extension and timestamp are set dynamically in the ADF pipeline
+        blobFileName  = $cname                  # file extension and timestamp are set dynamically in the ADF pipeline
         outputFormat  = $OutputFormat
     }
 }
@@ -167,17 +178,25 @@ New-AzRoleAssignment `
 # get the blob service endpoint
 $blobEndpoint = (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName).PrimaryEndpoints.Blob
 
-# Create the Azure Blob Storage linked service using system-assigned managed identity
-$blobStorageLs = @{
-    name       = "AzureBlobStorageLinkedService"
-    properties = @{
-        type           = "AzureBlobStorage"
-        typeProperties = @{
-            serviceEndpoint = $blobEndpoint
-            authentication = "ManagedIdentity"
+if($blobEndpoint){
+    Write-Host "Blob service endpoint: $blobEndpoint" -ForegroundColor Green
+    # Create the Azure Blob Storage linked service using system-assigned managed identity
+    $blobStorageLs = @{
+        name       = "AzureBlobStorageLinkedService"
+        properties = @{
+            type           = "AzureBlobStorage"
+            typeProperties = @{
+                serviceEndpoint = $blobEndpoint
+                authentication = "ManagedIdentity"
+            }
         }
     }
 }
+else {
+    Write-Host "Failed to retrieve blob service endpoint." -ForegroundColor Red
+    exit 1
+}
+
 
 # Deploy the linked service if it doesn't exist
 $existingBlobLs = Get-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $blobStorageLs.name -ErrorAction SilentlyContinue
@@ -284,8 +303,6 @@ catch {
     exit 1
 }
 
-
-#── 4.2. BUILD & DEPLOY BLOB SINK DATASET (JSON) ────────────────────────
 #── 4.2. BUILD & DEPLOY BLOB SINK DATASET (JSON) ────────────────────────
 if ($OutputFormat -ieq "json") {
     $jsonDs = @{
@@ -330,7 +347,6 @@ if ($OutputFormat -ieq "json") {
 
 }
 
-#── 4.3. BUILD & DEPLOY BLOB SINK DATASET (PARQUET) ─────────────────────
 #── 4.3. BUILD & DEPLOY BLOB SINK DATASET (PARQUET) ─────────────────────
 if ($OutputFormat -ieq "parquet") {
     $parquetDs = @{
