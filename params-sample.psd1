@@ -1,0 +1,10 @@
+@{
+	ResourceGroupName = "resource_group_name"
+	StorageAccountName = "storage_account_name"
+	AzureRegion = "Azure_deployment_region"
+	DataFactoryName = "data_factory_name"
+	BQDatasetID = "your_BQ_dataset_Name"
+	BQProjectID = "project_name_containing_dataset"
+	OutputFormat = "json_or_parquet"
+	CSVFile = "path_to_exported_tables_csv"
+}

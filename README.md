@@ -56,7 +56,7 @@ You can either run the command like below and replace the text;
 Or use the params.txt and pass it to the powershell script;
 
 ```powershell
-$parameters = Get-Content -Path "params.txt"
+$parameters = Import-PowerShellDataFile -Path "params.psd1"
 .\New-BigQueryToADFPipeline.ps1 @parameters
 ```
 
