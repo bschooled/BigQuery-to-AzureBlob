@@ -120,7 +120,27 @@ New-AzRoleAssignment `
   -RoleDefinitionName "Storage Blob Data Contributor" `
   -Scope "/subscriptions/$((Get-AzContext).Subscription.Id)/resourceGroups/$ResourceGroupName/providers/Microsoft.Storage/storageAccounts/$StorageAccountName"
 
+# get the blob service endpoint
+$blobEndpoint = (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName).PrimaryEndpoints.Blob
 
+# Create the Azure Blob Storage linked service using system-assigned managed identity
+$blobStorageLs = @{
+    name       = "AzureBlobStorageLinkedService"
+    properties = @{
+        type           = "AzureBlobStorage"
+        typeProperties = @{
+            serviceEndpoint = $blobEndpoint
+            authentication = "ManagedIdentity"
+        }
+    }
+}
+
+# Deploy the linked service if it doesn't exist
+$existingBlobLs = Get-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $blobStorageLs.name -ErrorAction SilentlyContinue
+$blobStorageLsObj = ($blobStorageLs | ConvertTo-Json -Depth 100) | ConvertFrom-Json
+if (-not $existingBlobLs) {
+    Set-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $blobStorageLs.name -Definition $blobStorageLsObj
+}
 
 $allLs = Get-AzDataFactoryV2LinkedService `
     -ResourceGroupName $ResourceGroupName `
@@ -207,12 +227,21 @@ $bqDs = @{
 }
 
 # Deploy BigQuery dataset
-$bqObj = ($bqDs | ConvertTo-Json -Depth 100) | ConvertFrom-Json
-Set-AzDataFactoryV2Dataset `
-    -ResourceGroupName $ResourceGroupName `
-    -DataFactoryName    $DataFactoryName `
-    -Name               $bqDs.name `
-    -Definition         $bqObj
+try {
+    Write-Host "Deploying BigQuery dataset: $($bqDs.name)" -ForegroundColor Green
+    $bqObj = ($bqDs | ConvertTo-Json -Depth 100) | ConvertFrom-Json
+    Set-AzDataFactoryV2Dataset `
+        -ResourceGroupName $ResourceGroupName `
+        -DataFactoryName    $DataFactoryName `
+        -Name               $bqDs.name `
+        -Definition         $bqObj
+}
+catch {
+    Write-Host "Failed to deploy BigQuery dataset: $($bqDs.name)" -ForegroundColor Red
+    Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
 
 #── 4.2. BUILD & DEPLOY BLOB SINK DATASET (JSON) ────────────────────────
 if ($OutputFormat -eq "Json") {
@@ -243,12 +272,20 @@ if ($OutputFormat -eq "Json") {
     }
 
     # Deploy JSON sink dataset
-    $jsonObj = ($jsonDs | ConvertTo-Json -Depth 100) | ConvertFrom-Json
-    Set-AzDataFactoryV2Dataset `
-        -ResourceGroupName $ResourceGroupName `
-        -DataFactoryName    $DataFactoryName `
-        -Name               $jsonDs.name `
-        -Definition         $jsonObj
+    try {
+        $jsonObj = ($jsonDs | ConvertTo-Json -Depth 100) | ConvertFrom-Json
+        Set-AzDataFactoryV2Dataset `
+            -ResourceGroupName $ResourceGroupName `
+            -DataFactoryName    $DataFactoryName `
+            -Name               $jsonDs.name `
+            -Definition         $jsonObj
+    }
+    catch {
+        Write-Host "Failed to deploy JSON sink dataset: $($jsonDs.name)" -ForegroundColor Red
+        Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+
 }
 
 #── 4.3. BUILD & DEPLOY BLOB SINK DATASET (PARQUET) ─────────────────────
@@ -276,12 +313,20 @@ if ($OutputFormat -eq "Parquet") {
     }
 
     # Deploy Parquet sink dataset
-    $parquetObj = ($parquetDs | ConvertTo-Json -Depth 100) | ConvertFrom-Json
-    Set-AzDataFactoryV2Dataset `
-        -ResourceGroupName $ResourceGroupName `
-        -DataFactoryName    $DataFactoryName `
-        -Name               $parquetDs.name `
-        -Definition         $parquetObj
+    try {
+        $parquetObj = ($parquetDs | ConvertTo-Json -Depth 100) | ConvertFrom-Json
+        Set-AzDataFactoryV2Dataset `
+            -ResourceGroupName $ResourceGroupName `
+            -DataFactoryName    $DataFactoryName `
+            -Name               $parquetDs.name `
+            -Definition         $parquetObj
+    }
+    catch {
+        Write-Host "Failed to deploy Parquet sink dataset: $($parquetDs.name)" -ForegroundColor Red
+        Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+
 }
 
 # 5) BUILD & DEPLOY ADF PIPES
