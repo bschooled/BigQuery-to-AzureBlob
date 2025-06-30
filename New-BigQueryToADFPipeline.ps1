@@ -96,7 +96,7 @@ $tableList = foreach ($t in $tables) {
 
     [PSCustomObject]@{
         tableName     = $cname
-        datasetName   = $BQDatasetID
+        bqDatasetId   = $BQDatasetID
         containerName = $cname
         blobFileName  = "$cname"                  # file extension and timestamp are set dynamically in the ADF pipeline
         outputFormat  = $OutputFormat
@@ -172,7 +172,6 @@ elseif ($bigQueryLsName.Count -gt 1) {
     Write-Host "Multiple BigQuery linked services found" -ForegroundColor Yellow
     $matchBQName = Read-Host "Please specify the BigQuery linked service name to use"
     $bigQueryLsName = $matchBQName
-    return
 }
 
 # Find the Azure Blob Storage linked service
@@ -201,10 +200,9 @@ if (-not $blobStorageLsName) {
 elseif ($blobStorageLsName.Count -gt 1) {
     Write-Host "Multiple Azure Blob Storage linked services found" -ForegroundColor Yellow
     $matchBlobName = Read-Host "Please specify the Blob Storage linked service name to use"
+    $matchBlobName = Read-Host "Please specify the Blob Storage linked service name to use"
     $blobStorageLsName = $matchBlobName
-    return
 }
-
 
 Write-Host "Using BigQuery LS:     $bigQueryLsName"
 Write-Host "Using BlobStorage LS:  $blobStorageLsName"
@@ -244,9 +242,9 @@ catch {
 
 
 #── 4.2. BUILD & DEPLOY BLOB SINK DATASET (JSON) ────────────────────────
-if ($OutputFormat -eq "Json") {
+#── 4.2. BUILD & DEPLOY BLOB SINK DATASET (JSON) ────────────────────────
+if ($OutputFormat -ieq "json") {
     $jsonDs = @{
-        name       = "BlobSink_JSON"
         properties = @{
             type              = "Json"
             linkedServiceName = @{ referenceName = $blobStorageLsName; type = "LinkedServiceReference" }
@@ -289,9 +287,9 @@ if ($OutputFormat -eq "Json") {
 }
 
 #── 4.3. BUILD & DEPLOY BLOB SINK DATASET (PARQUET) ─────────────────────
-if ($OutputFormat -eq "Parquet") {
+#── 4.3. BUILD & DEPLOY BLOB SINK DATASET (PARQUET) ─────────────────────
+if ($OutputFormat -ieq "parquet") {
     $parquetDs = @{
-        name       = "BlobSink_Parquet"
         properties = @{
             type              = "Parquet"
             linkedServiceName = @{ referenceName = $blobStorageLsName; type = "LinkedServiceReference" }
@@ -341,7 +339,7 @@ foreach ($row in $tableList) {
         name       = $childName
         properties = @{
             parameters = @{
-                datasetName   = @{ type = "String" }
+                bqDatasetId   = @{ type = "String" }
                 tableName     = @{ type = "String" }
                 containerName = @{ type = "String" }
                 blobFileName  = @{ type = "String" }
@@ -361,7 +359,7 @@ foreach ($row in $tableList) {
                                 name           = "Copy_Parquet"
                                 type           = "Copy"
                                 inputs         = @(@{ referenceName = "BigQueryDataset"; type = "DatasetReference"; parameters = @{
-                                            datasetName = "@pipeline().parameters.datasetName"
+                                            datasetName = "@pipeline().parameters.bqDatasetId"
                                             tableName   = "@pipeline().parameters.tableName"
                                         }
                                     })
@@ -431,7 +429,7 @@ foreach ($row in $tableList) {
         typeProperties = @{
             pipeline   = @{ referenceName = $childName; type = "PipelineReference" }
             parameters = @{
-                datasetName   = $row.datasetName
+                bqDatasetId   = $row.bqDatasetId
                 tableName     = $row.tableName
                 containerName = $row.containerName
                 blobFileName  = $row.tableName
