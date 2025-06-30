@@ -60,7 +60,58 @@ $parameters = Get-Content -Path "params.txt"
 .\New-BigQueryToADFPipeline.ps1 @parameters
 ```
 
-
 ## 5. Setup Linked Services (Optional if existing)
 
-### a. Create Service Account and download key
+If you received a message from the script that it could not find a linked service for either Blob or BigQuery you will need to take additional steps to continue.
+
+### a. BigQuery Link Service Missing: Create Service Account in GCP and download key
+
+From the Google Cloud Console, open a cloud shell.
+
+Once opened you will need to run the following commands.
+
+1. Create the Service Account
+
+```bash
+gcloud iam service-accounts create adf-bq-sa \
+  --description="ADF BigQuery access" \
+  --display-name="ADF BigQuery SA"
+```
+
+2. Add IAM Permissions to the Service Account. Replace "YOUR-GCP-PROJECT" with your project ID.
+
+```bash
+gcloud projects add-iam-policy-binding YOUR-GCP-PROJECT \
+  --member=serviceAccount:adf-bq-sa@YOUR-GCP-PROJECT.iam.gserviceaccount.com \
+  --role=roles/bigquery.jobUser
+
+gcloud projects add-iam-policy-binding YOUR-GCP-PROJECT \
+  --member=serviceAccount:adf-bq-sa@YOUR-GCP-PROJECT.iam.gserviceaccount.com \
+  --role=roles/bigquery.dataViewer
+```
+
+3. Create and export the key to JSON
+
+```bash
+gcloud iam service-accounts keys create key.json \
+  --iam-account=adf-bq-sa@YOUR-GCP-PROJECT.iam.gserviceaccount.com
+```
+
+4. Download the key from Cloud Shell
+
+From the Cloud Shell panel, click the three dots next to session information and select "Download File". In the path add key.json to the end. Make sure to only keep this key locally until after we have successfully uploaded to the linked service and then delete it.
+
+5. Create Linked Service in Data Factory Studio.
+
+  1. From portal.azure.com search "Data Factories" and open.
+  2. Choose the Data Factory name that was created by the script (or a prior created one you specified)
+  3. In the Overview panel, click "Launch Studio"
+  4. In the left side panel, click "Manage"
+  5. In the new flyout panel, click "Linked Services", and then click "New".
+  6. In the search panel, search "BigQuery" and select "Google BigQuery" and continue.
+  7. Name the linked service and note the name as you will need to input.
+  8. You will need to input your Google Project ID, change "Authentication Type" to "Service Authentication" and upload the key.json you created earlier. 
+  9. Once done click "Create".
+  10. To validate, click the newly created Linked Service, and in the bottom right select "Test Connection". Ensure the connection is successful before continuing.
+
+### b. Azure Storage Linked Service Missing
