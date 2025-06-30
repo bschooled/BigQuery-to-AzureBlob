@@ -34,36 +34,46 @@ if (-not $(Get-Module -Name Az* -ListAvailable -ErrorAction SilentlyContinue)) {
     Install-Module -Name Az -AllowClobber -Force -SkipPublisherCheck -Scope CurrentUser
 }
 
-# Ensure Azure CLI is authenticated and import context into Az PowerShell if possible
-if (-not (az account show)) {
-    Write-Host "You are not logged in to Azure CLI. Please log in using 'az login'." -ForegroundColor Red
-    az login --use-device-code
-    if (-not (az account show)) {
-        Write-Host "Failed to authenticate with Azure CLI. Please check your Azure credentials." -ForegroundColor Red
+if (-not (Get-Module -Name newtonsoft.json -ListAvailable -ErrorAction SilentlyContinue)) {
+    Write-Host "Newtonsoft.Json module not found. Installing..." -ForegroundColor Yellow
+    Install-Module -Name Newtonsoft.Json -AllowClobber -Force -Scope CurrentUser -confirm:$false -SkipPublisherCheck
+    Import-Module -Name Newtonsoft.Json -ErrorAction Stop
+}
+
+# Ensure there is an active Az PowerShell login/session and credentials are not expired
+try {
+    $azContext = Get-AzContext
+    if (-not $azContext -or -not $azContext.Account -or -not $azContext.Account.Id) {
+        # Try interactive login first
+        Connect-AzAccount -ErrorAction Stop
+        $azContext = Get-AzContext
+    }
+    else {
+        # Check for expired credentials or missing token cache
+        try {
+            # Try to get an access token for validation
+            $null = Get-AzAccessToken -ErrorAction Stop
+        }
+        catch {
+            Write-Host "Interactive login failed or not possible, falling back to device authentication..." -ForegroundColor Yellow
+            Connect-AzAccount -UseDeviceAuthentication -ErrorAction Stop
+            $azContext = Get-AzContext
+        }
+    }
+    if (-not $azContext -or -not $azContext.Account -or -not $azContext.Account.Id) {
+        Write-Host "Failed to establish an active Az PowerShell session." -ForegroundColor Red
         exit 1
     }
 }
-
-# Try to import Azure CLI context into Az PowerShell (requires Az.Accounts >= 2.2.0)
-if (-not (Get-AzContext)) {
-    Write-Host "Missing Az context, attempting to import Azure CLI context into Az PowerShell..." -ForegroundColor Yellow
-    try {
-        $token = az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv
-        $accountId = az account show --query user.name -o tsv
-        $tenantId = az account show --query tenantId -o tsv
-        Connect-AzAccount -AccessToken $token -AccountId $accountId -TenantId $tenantId -ErrorAction Stop
-    }
-    catch {
-        Write-Host "Failed to import Azure CLI context or establish Azure context in PowerShell." -ForegroundColor Red
-        exit 1
-    }
+catch {
+    Write-Host "Failed to establish an active Az PowerShell session: $_" -ForegroundColor Red
+    exit 1
 }
 
 # Check if resource group exists, if not create it
 Write-Host "Checking if resource group '$ResourceGroupName' exists..." -ForegroundColor Yellow
 if (-not $(Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
-    Write-Host "Resource group '$ResourceGroupName' does not exist. Please create it first." -ForegroundColor Red
-    # 1) CREATE RESOURCE GROUP
+    Write-Host "Resource group '$ResourceGroupName' does not exist. Creating it now..." -ForegroundColor Yellow
     New-AzResourceGroup -Name $ResourceGroupName -Location $AzureRegion -Force
 }
 else {
@@ -105,7 +115,7 @@ else {
 # Add current public IP to allow list
 try {
     $myIp = (Invoke-RestMethod -Uri "https://api.ipify.org?format=text" -UseBasicParsing).Trim()
-    Write-Host "Detected public IP: $myIp" -ForegroundColor Green
+    $myIp = (Invoke-RestMethod -Uri "https://api.ipify.org?format=text").Trim()
 }
 catch {
     Write-Host "Failed to retrieve or add your public IP address. Please check your internet connection." -ForegroundColor Red
@@ -278,9 +288,16 @@ if (-not $(Test-Path -Path $CSVFile)) {
     $CSVFile = Read-Host "Enter the path to your BigQuery tables CSV file"
 }
 
-$tables = Import-Csv -Path $CSVFile
-if (-not $tables.table_Id) {
-    Write-Host "CSV file does not contain 'table_Id' column. Please ensure the CSV is formatted correctly." -ForegroundColor Red
+try {
+    $tables = Import-Csv -Path $CSVFile -ErrorAction Stop
+}
+catch {
+    Write-Host "Failed to import CSV file '$CSVFile'. The file may be malformed or unreadable. Error: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
+if (-not $tables -or -not $tables.table_Id) {
+    Write-Host "CSV file does not contain 'table_Id' column or is empty. Please ensure the CSV is formatted correctly." -ForegroundColor Red
     exit 1
 }
 
@@ -288,14 +305,10 @@ if (-not $tables.table_Id) {
 function Test-StorageAccountPermission {
     param($StorageAccountName)
     try {
-        # Attempt to list containers using az CLI as a permission check
-        az storage container list --account-name $StorageAccountName --auth-mode login --only-show-errors 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            return $true
-        }
-        else {
-            return $false
-        }
+        $ctx = (Get-AzStorageAccount -Name $StorageAccountName -ResourceGroupName $ResourceGroupName -ErrorAction Stop).Context
+        # Try to list containers as a permission check
+        Get-AzStorageContainer -Context $ctx -ErrorAction Stop | Out-Null
+        return $true
     }
     catch {
         return $false
@@ -357,10 +370,12 @@ else {
     Write-Host "Permission check passed: Able to list containers in storage account '$StorageAccountName'." -ForegroundColor Green
 }
 
-$tableList = foreach ($t in $tables) {
+$tableList = @()
+foreach ($t in $tables) {
     # Azure container names must be lowercase, 3-63 chars, alphanumeric or hyphen, start/end with letter/number
     $cname = $t.table_Id.ToLower() -replace '[^a-z0-9-]', '-' # replace invalid chars with hyphen
     $cname = $cname.Trim('-') # remove leading/trailing hyphens
+    if ([string]::IsNullOrWhiteSpace($cname)) { $cname = "container000" }
     if ($cname.Length -lt 3) { $cname = $cname.PadRight(3, '0') }
     if ($cname.Length -gt 63) { $cname = $cname.Substring(0, 63) }
 
@@ -397,12 +412,11 @@ $tableList = foreach ($t in $tables) {
         Write-Host "Container '$cname' already exists." -ForegroundColor Green
     }
 
-    [PSCustomObject]@{
-        tableName     = $cname
-        bqDatasetId   = $BQDatasetID
-        containerName = $cname
-        blobFileName  = $cname                  # Only the base name is set here; file extension and timestamp are appended dynamically in the ADF pipeline
-        outputFormat  = $OutputFormat
+    $tableList += [PSCustomObject]@{
+        tableName    = $cname
+        bqDatasetId  = $BQDatasetID
+        blobFileName = $cname                  # Only the base name is set here; file extension and timestamp are appended dynamically by the ADF pipeline, not in this script
+        outputFormat = $OutputFormat
     }
 }
 
@@ -414,6 +428,47 @@ $tableList = foreach ($t in $tables) {
 # 4) CREATE LINKED SERVICES
 
 # setup the Azure Blob Storage linked service
+function ConvertTo-AdfSafeJson {
+    param (
+        [Parameter(Mandatory)]
+        [object]$InputObject,
+
+        [ValidateSet("Indented", "None")]
+        [string]$Formatting = "Indented"
+    )
+
+    if (-not ([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'Newtonsoft.Json' })) {
+        Add-Type -AssemblyName 'Newtonsoft.Json'
+    }
+
+    # Step 2: Serialize with Newtonsoft and ignore reference loops
+    $settings = New-Object Newtonsoft.Json.JsonSerializerSettings
+    $settings.ReferenceLoopHandling = [Newtonsoft.Json.ReferenceLoopHandling]::Ignore
+    $settings.Formatting = [Newtonsoft.Json.Formatting]::$Formatting
+
+    # Step 2: Force all nested objects into .NET-safe representations (JObject handles this better than SerializeObject)
+    $jObject = [Newtonsoft.Json.Linq.JObject]::FromObject($InputObject, [Newtonsoft.Json.JsonSerializer]::Create($settings))
+
+    # Step 3: Serialize to JSON string
+    $rawJson = $jObject.ToString()
+
+    # Strip quotes from known ADF expressions
+    # NOTE: This regex only matches simple ADF expressions starting with the listed keywords and may not cover all valid ADF expressions or edge cases (e.g., nested or complex expressions).
+    # For complex scenarios, manual review of the generated JSON may be required to ensure correct handling of ADF expressions.
+    <#$expressionKeywords = @(
+        'dataset', 'pipeline', 'activity', 'item', 'trigger',
+        'variables', 'concat', 'equals', 'if', 'and', 'or',
+        'not', 'greater', 'less', 'addDays', 'utcNow', 'format', 'substring'
+    ) -join '|' 
+     #>
+
+    #$regex = '"(@(?:' + $expressionKeywords + ')[^"]*?)"'
+    #$safeJson = $rawJson -replace $regex, '$1'
+
+    return $rawJson
+}
+
+
 $adf = Get-AzDataFactoryV2 -ResourceGroupName $ResourceGroupName -Name $DataFactoryName
 $adfIdentity = $adf.Identity.PrincipalId
 
@@ -440,12 +495,12 @@ $blobEndpoint = (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Nam
 if ($blobEndpoint) {
     Write-Host "Blob service endpoint: $blobEndpoint" -ForegroundColor Green
     # Create the Azure Blob Storage linked service using system-assigned managed identity
-    $blobStorageLs = @{
+    $blobStorageLs = [ordered]@{
         name       = "AzureBlobStorageLinkedService"
-        properties = @{
+        properties = [ordered]@{
             type           = "AzureBlobStorage"
-            typeProperties = @{
-                serviceEndpoint = $blobEndpoint
+            typeProperties = [ordered]@{
+                serviceEndpoint = $($blobEndpoint).ToString()
                 authentication  = "ManagedIdentity"
             }
         }
@@ -456,20 +511,17 @@ else {
     exit 1
 }
 
-$blobStorageLs = $blobStorageLs | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json
+[string]$blobStorageLsJson = ConvertTo-AdfSafeJson -InputObject $blobStorageLs 
+$blobLsTmp = [System.IO.Path]::GetTempFileName()
+Set-Content -Path $blobLsTmp -Value $blobStorageLsJson -Encoding UTF8
 
 # Deploy the linked service if it doesn't exist
 $existingBlobLs = Get-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -ErrorAction SilentlyContinue
-$filteredBlob = $existingBlobLs | Where-Object { $_.Properties -match "BigQuery" }
+$filteredBlob = $existingBlobLs | Where-Object { $_.Properties -match "Blob" }
 
 if (-not $filteredBlob) {
     Write-Host "Creating new Azure Blob Storage linked service: $($blobStorageLs.name)" -ForegroundColor Green
-    Set-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $blobStorageLs.name -Definition $blobStorageLs
-}
-
-if (-not $filteredBlob) {
-    Write-Host "Creating new Azure Blob Storage linked service: $($blobStorageLs.name)" -ForegroundColor Green
-    Set-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $blobStorageLs.name -DefinitionFile $BlobLStmpFile
+    Set-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $blobStorageLs.name -DefinitionFile $blobLsTmp
 }
 
 # Find the BigQuery linked 
@@ -496,9 +548,11 @@ elseif ($bigQueryLsName.Count -gt 1) {
     $matchBQName = Read-Host "Please specify the BigQuery linked service name to use"
     $bigQueryLsName = $matchBQName
 }
+[string]$bigQueryLsName = $bigQueryLsName.ToString()
 
 # Find the Azure Blob Storage linked service
 $blobStorageLsName = $existingBlobLs | Where-Object { $_.Properties -match "Blob" }
+$blobStorageLsName = $blobStorageLsName.Name
 
 if (-not $blobStorageLsName) {
     $i = 0
@@ -509,6 +563,7 @@ if (-not $blobStorageLsName) {
         $blobStorageLsName = Read-Host "Enter the name of the Azure Blob Storage linked service to use"
         # Find the Azure Blob Storage linked service
         $blobStorageLsName = $existingBlobLs | Where-Object { $_.Properties -match "Blob" }
+        $blobStorageLsName = $blobStorageLsName.Name
         $i++
     }
     if (-not $blobStorageLsName) {
@@ -518,32 +573,43 @@ if (-not $blobStorageLsName) {
 }
 elseif ($blobStorageLsName.Count -gt 1) {
     Write-Host "Multiple Azure Blob Storage linked services found" -ForegroundColor Yellow
-    Write-Output $blobStorageLsName | ForEach-Object { $_.Name }
-    $matchBlobName = Read-Host "Please specify the Blob Storage linked service name to use"
-    $blobStorageLsName = $matchBlobName
+    $availableNames = $blobStorageLsName | ForEach-Object { $_.Name }
+    Write-Output $availableNames
+    $matchBlobName = $null
+    while (-not $availableNames -contains $matchBlobName) {
+        $matchBlobName = Read-Host "Please specify the Blob Storage linked service name to use from the list above"
+        if (-not $availableNames -contains $matchBlobName) {
+            Write-Host "Invalid selection. Please enter a valid linked service name from the list." -ForegroundColor Red
+        }
+    }
+    $blobStorageLsName = $blobStorageLsName | Where-Object { $_.Name -eq $matchBlobName }
+    $blobStorageLsName = $blobStorageLsName.Name
 }
+[string]$blobStorageLsName = $blobStorageLsName
 
 Write-Host "Using BigQuery LS:     $bigQueryLsName"
 Write-Host "Using BlobStorage LS:  $blobStorageLsName"
-
 
 #── 4.1. BUILD & DEPLOY BIGQUERY SOURCE DATASET ─────────────────────────
 $bqDs = [ordered]@{
     name       = "BigQueryDataset"
     properties = [ordered]@{
-        type              = "GoogleBigQuery"
+        type              = "GoogleBigQueryV2Object"
         linkedServiceName = [ordered]@{ referenceName = $bigQueryLsName; type = "LinkedServiceReference" }
         parameters        = [ordered]@{
             datasetName = [ordered]@{ type = "String" }
             tableName   = [ordered]@{ type = "String" }
         }
         typeProperties    = [ordered]@{
-            tableName = "@concat(dataset().datasetName, '.', dataset().tableName)"
+            dataset = "@dataset().datasetName"
+            table   = "@dataset().tableName"
         }
     }
 }
 
-$bqDs = $bqDs | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json
+$bqDsJson = ConvertTo-AdfSafeJson -InputObject $bqDs
+$bqDsTmp = [System.IO.Path]::GetTempFileName()
+Set-Content -Path $bqDsTmp -Value $bqDsJson -Encoding UTF8
 
 # Deploy BigQuery dataset
 $existingBqDs = Get-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $bqDs.name -ErrorAction SilentlyContinue
@@ -558,7 +624,8 @@ else {
             -ResourceGroupName $ResourceGroupName `
             -DataFactoryName    $DataFactoryName `
             -Name               $bqDs.name `
-            -Definition         $bqDs
+            -DefinitionFile     $bqDsTmp `
+            -Verbose
     }
     catch {
         Write-Host "Failed to deploy BigQuery dataset: $($bqDs.name)" -ForegroundColor Red
@@ -568,7 +635,7 @@ else {
 }
 
 #── 4.2. BUILD & DEPLOY BLOB SINK DATASET (JSON) ────────────────────────
-if ($OutputFormat -ieq "json") {
+if ($OutputFormat) {
     $jsonDs = [ordered]@{
         name       = "BlobSink_JSON"
         properties = [ordered]@{
@@ -595,7 +662,10 @@ if ($OutputFormat -ieq "json") {
         }
     }
 
-    $jsonDs = $jsonDs | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json
+    $jsonDsJson = ConvertTo-AdfSafeJson -InputObject $jsonDs
+    $jsonDsTmp = [System.IO.Path]::GetTempFileName()
+    Set-Content -Path $jsonDsTmp -Value $jsonDsJson -Encoding UTF8
+
     $existingJsonDs = Get-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $jsonDs.name -ErrorAction SilentlyContinue
 
     if ($existingJsonDs) {
@@ -608,7 +678,8 @@ if ($OutputFormat -ieq "json") {
                 -ResourceGroupName $ResourceGroupName `
                 -DataFactoryName    $DataFactoryName `
                 -Name               $jsonDs.name `
-                -Definition         $jsonDs.properties
+                -DefinitionFile     $jsonDsTmp `
+                -Verbose
         }
         catch {
             Write-Host "Failed to deploy JSON sink dataset: $($jsonDs.name)" -ForegroundColor Red
@@ -619,7 +690,7 @@ if ($OutputFormat -ieq "json") {
 }
 
 #── 4.3. BUILD & DEPLOY BLOB SINK DATASET (PARQUET) ─────────────────────
-if ($OutputFormat -ieq "parquet") {
+if ($OutputFormat) {
     $parquetDs = [ordered]@{
         name       = "BlobSink_Parquet"
         properties = [ordered]@{
@@ -642,7 +713,10 @@ if ($OutputFormat -ieq "parquet") {
         }
     }
 
-    $parquetDs = $parquetDs | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json
+    $parquetDsJson = ConvertTo-AdfSafeJson -InputObject $parquetDs 
+    $parquetDsTmp = [System.IO.Path]::GetTempFileName()
+    Set-Content -Path $parquetDsTmp -Value $parquetDsJson -Encoding UTF8
+
     $existingParquetDs = Get-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $parquetDs.name -ErrorAction SilentlyContinue
 
     if ($existingParquetDs) {
@@ -654,7 +728,8 @@ if ($OutputFormat -ieq "parquet") {
                 -ResourceGroupName $ResourceGroupName `
                 -DataFactoryName    $DataFactoryName `
                 -Name               $parquetDs.name `
-                -Definition         $parquetDs
+                -DefinitionFile     $parquetDsTmp `
+                -Verbose
         }
         catch {
             Write-Host "Failed to deploy Parquet sink dataset: $($parquetDs.name)" -ForegroundColor Red
@@ -666,12 +741,14 @@ if ($OutputFormat -ieq "parquet") {
 
 # 5) BUILD & DEPLOY ADF PIPES
 $parent = [ordered]@{
-    name       = "MasterPipeline"
+    name       = "MainPipeline"
     properties = [ordered]@{ activities = @() }
 }
 
+Write-Host "Will create child pipelines for each table in the CSV file. Total count is $($tableList.Count)" -ForegroundColor Yellow
 foreach ($row in $tableList) {
     $childName = "Copy_$($row.tableName)"
+    Write-Host "Processing table: $($row.tableName) with child pipeline name: $childName" -ForegroundColor Cyan
     $child = [ordered]@{
         name       = $childName
         properties = [ordered]@{
@@ -744,17 +821,24 @@ foreach ($row in $tableList) {
         }
     }
 
-    $child = $child | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json
+    $childObj = ConvertTo-AdfSafeJson -InputObject $child 
+    $childTmp = [System.IO.Path]::GetTempFileName()
+    Set-Content -Path $childTmp -Value $childObj -Encoding UTF8
+
     # Check if child pipeline exists
     $existingChild = Get-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $childName -ErrorAction SilentlyContinue
 
     if ($existingChild) {
         Write-Host "Updating existing pipeline: $childName" -ForegroundColor Yellow
-        Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $childName -Definition $child
+        Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $childName -DefinitionFile $childTmp -Confirm:$false
     }
     else {
         Write-Host "Creating new pipeline: $childName" -ForegroundColor Green
-        Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $childName -Definition $child
+        Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName `
+            -DataFactoryName $DataFactoryName `
+            -Name $childName `
+            -DefinitionFile $childTmp `
+            -Verbose
     }
 
     # add child to parent
@@ -766,13 +850,21 @@ foreach ($row in $tableList) {
             parameters = [ordered]@{
                 bqDatasetId   = $row.bqDatasetId
                 tableName     = $row.tableName
-                containerName = $row.containerName
-                blobFileName  = $row.tableName
+                containerName = $row.tableName  # Use tableName as containerName if that's the intent
+                blobFileName  = $row.blobFileName
                 outputFormat  = $row.outputFormat
             }
         }
     }
 }
 # deploy parent
-$parent = $parent | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json 
-Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $parent.name -Definition $parent
+$parentObj = ConvertTo-AdfSafeJson -InputObject $parent
+$parentTmp = [System.IO.Path]::GetTempFileName()
+Set-Content -Path $parentTmp -Value $parentObj -Encoding UTF8
+
+Write-Host "Deploying main pipeline: $($parent.name)" -ForegroundColor Green
+Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName `
+    -DataFactoryName $DataFactoryName `
+    -Name $parent.name `
+    -DefinitionFile $parentTmp `
+    -Verbose
