@@ -88,6 +88,11 @@ Once opened you will need to run the following commands.
   gcloud projects add-iam-policy-binding YOUR-GCP-PROJECT \
     --member=serviceAccount:adf-bq-sa@YOUR-GCP-PROJECT.iam.gserviceaccount.com \
     --role=roles/bigquery.dataViewer
+
+  gcloud projects add-iam-policy-binding zinc-advice-463318-s8 \
+  --member=serviceAccount:adf-bq-sa@YOUR-GCP-PROJECT.iam.gserviceaccount.com \
+  --role="roles/bigquery.readSessionUser"
+
   ```
 
   3. Create and export the key to JSON

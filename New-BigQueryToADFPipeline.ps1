@@ -25,13 +25,16 @@ param(
     [string]$BQDatasetID,
 
     [Parameter(Mandatory = $true, HelpMessage = "BigQuery project ID.")]
-    [string]$BQProjectID
+    [string]$BQProjectID,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Log analytics workspace ID.")]
+    [string]$LogAnalyticsWorkspaceName
 )
 
 # Ensure Az PowerShell module is installed
 if (-not $(Get-Module -Name Az* -ListAvailable -ErrorAction SilentlyContinue)) {
     Write-Host "Az module not found. Installing..." -ForegroundColor Yellow
-    Install-Module -Name Az -AllowClobber -Force -SkipPublisherCheck -Scope CurrentUser
+    Install-Module -Name Az -AllowClobber -Force -SkipPublisherCheck -Scope CurrentUser -confirm:$false
 }
 
 if (-not (Get-Module -Name newtonsoft.json -ListAvailable -ErrorAction SilentlyContinue)) {
@@ -109,6 +112,46 @@ else {
     }
     else {
         Write-Host "SystemAssigned managed identity is already enabled for Data Factory." -ForegroundColor Green
+    }
+}
+if ($LogAnalyticsWorkspaceName) {
+    Write-Host "Configuring Diagnostics settings on Data Factory - Log Analytics workspace: $LogAnalyticsWorkspaceName" -ForegroundColor Green
+    $workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName $ResourceGroupName -Name $LogAnalyticsWorkspaceName -ErrorAction SilentlyContinue
+    if (-not $workspace) {
+        Write-Host "Log Analytics workspace '$LogAnalyticsWorkspaceName' does not exist, creating ..." -ForegroundColor Yellow
+        $workspace = New-AzOperationalInsightsWorkspace `
+            -ResourceGroupName $ResourceGroupName `
+            -Name $LogAnalyticsWorkspaceName `
+            -Location $AzureRegion `
+            -Sku "PerGB2018"
+    }
+    else {
+        Write-Host "Log Analytics workspace '$LogAnalyticsWorkspaceName' already exists." -ForegroundColor Green
+    }
+
+    # Configure diagnostics settings
+    $diagName = "$DataFactoryName-law"
+    $existingDiag = Get-AzDiagnosticSetting -ResourceId $adf.DataFactoryId -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $diagName }
+    if (-not $existingDiag) {
+        Write-Host "Creating diagnostic settings '$diagName' for Data Factory..." -ForegroundColor Yellow
+        # Create diagnostic settings for logs and metrics using Az module object constructors
+        $logCategories = @("ActivityRuns", "PipelineRuns", "TriggerRuns")
+        $log = @()
+        foreach ($cat in $logCategories) {
+            $log += New-AzDiagnosticSettingLogSettingsObject -Category $cat -Enabled $true 
+        }
+        $metric = @()
+        $metric += New-AzDiagnosticSettingMetricSettingsObject -Category "AllMetrics" -Enabled $true
+
+        New-AzDiagnosticSetting `
+            -ResourceId $adf.DataFactoryId `
+            -WorkspaceId $workspace.ResourceId `
+            -Name $diagName `
+            -Log $log `
+            -Metric $metric
+    }
+    else {
+        Write-Host "Diagnostic settings '$diagName' already exist for Data Factory." -ForegroundColor Green
     }
 }
 
@@ -370,9 +413,31 @@ else {
     Write-Host "Permission check passed: Able to list containers in storage account '$StorageAccountName'." -ForegroundColor Green
 }
 
+# Ensure a container named 'pipelinelogs' exists at the root of the storage account
+$logsContainerName = "pipelinelogs"
+try {
+    $logsContainer = Get-AzStorageContainer -Name $logsContainerName -Context (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName).Context -ErrorAction SilentlyContinue
+    if (-not $logsContainer) {
+        Write-Host "Creating container: $logsContainerName"
+        $newLogsContainer = New-AzStorageContainer -Name $logsContainerName -Context (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName).Context -ErrorAction Stop
+        if ($newLogsContainer) {
+            Write-Host "Container '$logsContainerName' created successfully." -ForegroundColor Green
+        } else {
+            Write-Host "Failed to create container '$logsContainerName'." -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        Write-Host "Container '$logsContainerName' already exists." -ForegroundColor Green
+    }
+} catch {
+    Write-Host "An error occurred while ensuring the 'pipelinelogs' container exists: $_" -ForegroundColor Red
+    exit 1
+}
+
 $tableList = @()
 foreach ($t in $tables) {
     # Azure container names must be lowercase, 3-63 chars, alphanumeric or hyphen, start/end with letter/number
+    $originalTableName = $t.table_Id
     $cname = $t.table_Id.ToLower() -replace '[^a-z0-9-]', '-' # replace invalid chars with hyphen
     $cname = $cname.Trim('-') # remove leading/trailing hyphens
     if ([string]::IsNullOrWhiteSpace($cname)) { $cname = "container000" }
@@ -413,8 +478,9 @@ foreach ($t in $tables) {
     }
 
     $tableList += [PSCustomObject]@{
-        tableName    = $cname
-        bqDatasetId  = $BQDatasetID
+        tableName    = $originalTableName
+        containerName = $cname
+        datasetName  = $BQDatasetID
         blobFileName = $cname                  # Only the base name is set here; file extension and timestamp are appended dynamically by the ADF pipeline, not in this script
         outputFormat = $OutputFormat
     }
@@ -468,8 +534,6 @@ function ConvertTo-AdfSafeJson {
     return $rawJson
 }
 
-
-$adf = Get-AzDataFactoryV2 -ResourceGroupName $ResourceGroupName -Name $DataFactoryName
 $adfIdentity = $adf.Identity.PrincipalId
 
 # Assign Storage Blob Data Contributor role to Data Factory managed identity if not already assigned
@@ -502,6 +566,7 @@ if ($blobEndpoint) {
             typeProperties = [ordered]@{
                 serviceEndpoint = $($blobEndpoint).ToString()
                 authentication  = "ManagedIdentity"
+                accountKind     = "StorageV2"
             }
         }
     }
@@ -522,10 +587,19 @@ $filteredBlob = $existingBlobLs | Where-Object { $_.Properties -match "Blob" }
 if (-not $filteredBlob) {
     Write-Host "Creating new Azure Blob Storage linked service: $($blobStorageLs.name)" -ForegroundColor Green
     Set-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $blobStorageLs.name -DefinitionFile $blobLsTmp
+    Write-Host "Azure Blob Storage linked service created successfully." -ForegroundColor Green
+    # Get linked services again to ensure we have the latest
+    Start-Sleep -Seconds 5 # Wait for the service to be created
+    $existingBlobLs = Get-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -ErrorAction SilentlyContinue
+    $filteredBlob = $existingBlobLs | Where-Object { $_.Properties -match "Blob" }
+}
+if (-not $filteredBlob) {
+    Write-Host "Failed to create or retrieve Azure Blob Storage linked service." -ForegroundColor Red
+    exit 1
 }
 
-# Find the BigQuery linked 
-$bigQueryLsName = $existingBlobLs | Where-Object { $_.Properties -match "BigQuery" }
+# Find the BigQuery linked service
+$bigQueryLsName = $($existingBlobLs | Where-Object { $_.Properties -match "BigQuery" }).Name
 
 if (-not $bigQueryLsName) {
     $i = 0
@@ -533,9 +607,18 @@ if (-not $bigQueryLsName) {
         Write-Host "No BigQuery linked service found." -ForegroundColor Red
         Write-Host "Please create one in Data Factory first.`n
         You can follow the instructions in the README to setup, the script will wait for you to complete" -ForegroundColor Yellow
-        $bigQueryLsName = Read-Host "Enter the name of the BigQuery linked service to use"
-        $bigQueryLsName = $existingBlobLs | Where-Object { $_.Properties -match "BigQuery" }
-        $i++
+        $matchBQName = Read-Host "Enter the name of the BigQuery linked service to use"
+        $existingBlobLs = Get-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -ErrorAction SilentlyContinue
+        $bigQueryLsName = $($existingBlobLs | Where-Object { $_.Name -match $matchBQName }).Name
+        if (-not $bigQueryLsName) {
+            Write-Host "No BigQuery linked service found with the name '$matchBQName'. Please try again." -ForegroundColor Red
+            $i++
+        }
+        else {
+            Write-Host "Found BigQuery linked service: $bigQueryLsName" -ForegroundColor Green
+            $i=3
+        }
+
     }
     if (-not $bigQueryLsName) {
         Write-Host "No BigQuery linked service found after 3 attempts. Exiting." -ForegroundColor Red
@@ -544,15 +627,20 @@ if (-not $bigQueryLsName) {
 }
 elseif ($bigQueryLsName.Count -gt 1) {
     Write-Host "Multiple BigQuery linked services found" -ForegroundColor Yellow
-    Write-Output $bigQueryLsName | ForEach-Object { $_.Name }
-    $matchBQName = Read-Host "Please specify the BigQuery linked service name to use"
+    $availableNames = $bigQueryLsName | ForEach-Object { $_.Name }
+    Write-Output $availableNames
+    $matchBQName = $null
+    while (-not $availableNames -contains $matchBQName) {
+        $matchBQName = Read-Host "Please specify the BigQuery linked service name to use from the list above"
+        if (-not $availableNames -contains $matchBQName) {
+            Write-Host "Invalid selection. Please enter a valid linked service name from the list." -ForegroundColor Red
+        }
+    }
     $bigQueryLsName = $matchBQName
 }
-[string]$bigQueryLsName = $bigQueryLsName.ToString()
 
 # Find the Azure Blob Storage linked service
-$blobStorageLsName = $existingBlobLs | Where-Object { $_.Properties -match "Blob" }
-$blobStorageLsName = $blobStorageLsName.Name
+$blobStorageLsName = $($existingBlobLs | Where-Object { $_.Properties -match "Blob" }).Name
 
 if (-not $blobStorageLsName) {
     $i = 0
@@ -562,13 +650,15 @@ if (-not $blobStorageLsName) {
         You can follow the instructions in the README to setup, the script will wait for you to complete" -ForegroundColor Yellow
         $blobStorageLsName = Read-Host "Enter the name of the Azure Blob Storage linked service to use"
         # Find the Azure Blob Storage linked service
-        $blobStorageLsName = $existingBlobLs | Where-Object { $_.Properties -match "Blob" }
-        $blobStorageLsName = $blobStorageLsName.Name
-        $i++
-    }
-    if (-not $blobStorageLsName) {
-        Write-Host "No Azure Blob Storage linked service found after 3 attempts. Exiting." -ForegroundColor Red
-        exit 1
+        $existingBlobLs = Get-AzDataFactoryV2LinkedService -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -ErrorAction SilentlyContinue
+        $blobStorageLsName = $existingBlobLs | Where-Object {$_.Name -match $blobStorageLsName }
+        if (-not $blobStorageLsName) {
+            Write-Host "No Azure Blob Storage linked service found with the name '$blobStorageLsName'. Please try again." -ForegroundColor Red
+            $i++
+        }
+        else{
+            $i=3
+        }
     }
 }
 elseif ($blobStorageLsName.Count -gt 1) {
@@ -582,10 +672,8 @@ elseif ($blobStorageLsName.Count -gt 1) {
             Write-Host "Invalid selection. Please enter a valid linked service name from the list." -ForegroundColor Red
         }
     }
-    $blobStorageLsName = $blobStorageLsName | Where-Object { $_.Name -eq $matchBlobName }
-    $blobStorageLsName = $blobStorageLsName.Name
+    $blobStorageLsName = $matchBlobName
 }
-[string]$blobStorageLsName = $blobStorageLsName
 
 Write-Host "Using BigQuery LS:     $bigQueryLsName"
 Write-Host "Using BlobStorage LS:  $blobStorageLsName"
@@ -597,12 +685,12 @@ $bqDs = [ordered]@{
         type              = "GoogleBigQueryV2Object"
         linkedServiceName = [ordered]@{ referenceName = $bigQueryLsName; type = "LinkedServiceReference" }
         parameters        = [ordered]@{
-            datasetName = [ordered]@{ type = "String" }
-            tableName   = [ordered]@{ type = "String" }
+            dataset   = [ordered]@{ type = "String" }
+            tableName = [ordered]@{ type = "String" }
         }
         typeProperties    = [ordered]@{
-            dataset = "@dataset().datasetName"
-            table   = "@dataset().tableName"
+            dataset = @{ type = "Expression"; value = "@dataset().dataset" }
+            table   = @{ type = "Expression"; value = "@dataset().tableName" }
         }
     }
 }
@@ -615,7 +703,17 @@ Set-Content -Path $bqDsTmp -Value $bqDsJson -Encoding UTF8
 $existingBqDs = Get-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $bqDs.name -ErrorAction SilentlyContinue
 
 if ($existingBqDs) {
-    Write-Host "BigQuery dataset '$($bqDs.name)' already exists. Skipping creation." -ForegroundColor Green
+    Write-Host "BigQuery dataset '$($bqDs.name)' already exists, updating..." -ForegroundColor Green
+    # Update the existing dataset with the new definition
+    try {
+        Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $bqDs.name -DefinitionFile $bqDsTmp -Confirm:$false -Force -Verbose
+        Write-Host "BigQuery dataset updated successfully." -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Failed to update BigQuery dataset: $($bqDs.name)" -ForegroundColor Red
+        Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
 }
 else {
     try {
@@ -649,7 +747,7 @@ if ($OutputFormat) {
                 location    = [ordered]@{
                     type      = "AzureBlobStorageLocation"
                     container = "@dataset().containerName"
-                    blobPath  = "@dataset().blobFileName"
+                    fileName  = "@dataset().blobFileName"
                 }
                 compression = [ordered]@{
                     type  = "Gzip"
@@ -669,7 +767,9 @@ if ($OutputFormat) {
     $existingJsonDs = Get-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $jsonDs.name -ErrorAction SilentlyContinue
 
     if ($existingJsonDs) {
-        Write-Host "JSON sink dataset '$($jsonDs.name)' already exists. Skipping creation." -ForegroundColor Green
+        Write-Host "JSON sink dataset '$($jsonDs.name)' already exists, updating..." -ForegroundColor Green
+        # Update the existing dataset with the new definition
+        Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $jsonDs.name -DefinitionFile $jsonDsTmp -Confirm:$false -Force -Verbose
     }
     else {
         Write-Host "Deploying JSON sink dataset: $($jsonDs.name)" -ForegroundColor Green
@@ -679,6 +779,8 @@ if ($OutputFormat) {
                 -DataFactoryName    $DataFactoryName `
                 -Name               $jsonDs.name `
                 -DefinitionFile     $jsonDsTmp `
+                -Confirm:$false `
+                -Force `
                 -Verbose
         }
         catch {
@@ -704,7 +806,7 @@ if ($OutputFormat) {
                 location = [ordered]@{
                     type      = "AzureBlobStorageLocation"
                     container = "@dataset().containerName"
-                    blobPath  = "@dataset().blobFileName"
+                    fileName  = "@dataset().blobFileName"
                 }
             }
             format            = [ordered]@{
@@ -720,7 +822,9 @@ if ($OutputFormat) {
     $existingParquetDs = Get-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $parquetDs.name -ErrorAction SilentlyContinue
 
     if ($existingParquetDs) {
-        Write-Host "Parquet sink dataset '$($parquetDs.name)' already exists. Skipping creation." -ForegroundColor Green
+        Write-Host "Parquet sink dataset '$($parquetDs.name)' already exists, updating..." -ForegroundColor Green
+        # Update the existing dataset with the new definition
+        Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $parquetDs.name -DefinitionFile $parquetDsTmp -Confirm:$false -Force -Verbose
     }
     else {
         try {
@@ -729,6 +833,8 @@ if ($OutputFormat) {
                 -DataFactoryName    $DataFactoryName `
                 -Name               $parquetDs.name `
                 -DefinitionFile     $parquetDsTmp `
+                -Confirm:$false `
+                -Force `
                 -Verbose
         }
         catch {
@@ -746,6 +852,82 @@ $parent = [ordered]@{
 }
 
 Write-Host "Will create child pipelines for each table in the CSV file. Total count is $($tableList.Count)" -ForegroundColor Yellow
+
+# Add log datasets for writing log to blob storage (only need to create once per Data Factory)
+# LogInputDataset: Inline dataset for log content
+# LogOutputDataset: Blob dataset for log file
+$logInputDs = [ordered]@{
+    name = "LogInputDataset"
+    properties = [ordered]@{
+        type = "Json"
+        linkedServiceName = [ordered]@{ referenceName = $blobStorageLsName; type = "LinkedServiceReference" }
+        parameters = [ordered]@{
+            logContent = [ordered]@{ type = "String" }
+        }
+        typeProperties = [ordered]@{
+            location = [ordered]@{
+                type = "AzureBlobStorageLocation"
+                container = "pipelinelogs"
+                fileName = "*.json"
+            }
+        }
+        structure = @(
+            [ordered]@{
+                name = "logContent"
+                type = "String"
+            }
+        )
+    }
+}
+$logOutputDs = [ordered]@{
+    name = "LogOutputDataset"
+    properties = [ordered]@{
+        type = "Json"
+        linkedServiceName = [ordered]@{ referenceName = $blobStorageLsName; type = "LinkedServiceReference" }
+        parameters = [ordered]@{
+            logFileName = [ordered]@{ type = "String" }
+        }
+        typeProperties = [ordered]@{
+            location = [ordered]@{
+                type = "AzureBlobStorageLocation"
+                container = "pipelinelogs"
+                fileName  = "@dataset().logFileName"
+            }
+        }
+    }
+}
+
+# Convert log input dataset to JSON and save to temporary files
+$logInputDsJson = ConvertTo-AdfSafeJson -InputObject $logInputDs
+$logInputDsTmp = [System.IO.Path]::GetTempFileName()
+Set-Content -Path $logInputDsTmp -Value $logInputDsJson -Encoding UTF8
+
+# Convert log output dataset to JSON and save to temporary file
+$logOutputDsJson = ConvertTo-AdfSafeJson -InputObject $logOutputDs
+$logOutputDsTmp = [System.IO.Path]::GetTempFileName()
+Set-Content -Path $logOutputDsTmp -Value $logOutputDsJson -Encoding UTF8
+
+# Deploy log datasets if not already present
+$existingLogInputDs = Get-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $logInputDs.name -ErrorAction SilentlyContinue
+if (-not $existingLogInputDs) {
+    Write-Host "Deploying LogInputDataset: $($logInputDs.name)" -ForegroundColor Green
+    Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $logInputDs.name -DefinitionFile $logInputDsTmp -Confirm:$false -Force
+}
+else {
+    Write-Host "LogInputDataset already exists: $($logInputDs.name), updated" -ForegroundColor Yellow
+    # Update the existing dataset with the new definition
+    Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $logInputDs.name -DefinitionFile $logInputDsTmp -Confirm:$false -Force
+}
+$existingLogOutputDs = Get-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $logOutputDs.name -ErrorAction SilentlyContinue
+if (-not $existingLogOutputDs) {
+    Write-Host "Deploying LogOutputDataset: $($logOutputDs.name)" -ForegroundColor Green
+    Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $logOutputDs.name -DefinitionFile $logOutputDsTmp -Confirm:$false -Force
+}
+else {
+    Write-Host "LogOutputDataset already exists: $($logOutputDs.name), updated" -ForegroundColor Yellow
+    # Update the existing dataset with the new definition
+    Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $logOutputDs.name -DefinitionFile $logOutputDsTmp -Confirm:$false -Force
+}
 foreach ($row in $tableList) {
     $childName = "Copy_$($row.tableName)"
     Write-Host "Processing table: $($row.tableName) with child pipeline name: $childName" -ForegroundColor Cyan
@@ -753,7 +935,7 @@ foreach ($row in $tableList) {
         name       = $childName
         properties = [ordered]@{
             parameters = [ordered]@{
-                bqDatasetId   = [ordered]@{ type = "String" }
+                datasetName   = [ordered]@{ type = "String" }
                 tableName     = [ordered]@{ type = "String" }
                 containerName = [ordered]@{ type = "String" }
                 blobFileName  = [ordered]@{ type = "String" }
@@ -769,14 +951,30 @@ foreach ($row in $tableList) {
                             value = "@equals(toLower(pipeline().parameters.outputFormat),'parquet')"
                         }
                         ifTrueActivities  = @(
+                            # Debug: Set variable with source dataset and parameters
+                            [ordered]@{
+                                name = "Debug_Source_Parquet"
+                                type = "SetVariable"
+                                typeProperties = [ordered]@{
+                                    variableName = "debugSource"
+                                    value = "@concat('Source dataset: ', pipeline().parameters.datasetName, ', Table: ', pipeline().parameters.tableName)"
+                                }
+                            },
                             [ordered]@{
                                 name           = "Copy_Parquet"
                                 type           = "Copy"
-                                inputs         = @([ordered]@{ referenceName = "BigQueryDataset"; type = "DatasetReference"; parameters = [ordered]@{
-                                            datasetName = "@pipeline().parameters.bqDatasetId"
-                                            tableName   = "@pipeline().parameters.tableName"
-                                        }
-                                    })
+                                dependsOn      = @([ordered]@{
+                                    activity = "Debug_Source_Parquet"
+                                    dependencyConditions = @("Succeeded")
+                                })
+                                inputs         = @([ordered]@{ 
+                                    referenceName = "BigQueryDataset"; 
+                                    type = "DatasetReference"; 
+                                    parameters = [ordered]@{
+                                        dataset = "@pipeline().parameters.datasetName"   # <-- Pass correct datasetName
+                                        tableName   = "@pipeline().parameters.tableName"
+                                    }
+                                })
                                 outputs        = @([ordered]@{ referenceName = "BlobSink_Parquet"; type = "DatasetReference"; parameters = [ordered]@{
                                             containerName = "@pipeline().parameters.containerName"
                                             blobFileName  = "@concat(pipeline().parameters.blobFileName,'_',formatDateTime(utcnow(),'yyyyMMddHHmmss'),'.parquet')"
@@ -786,17 +984,100 @@ foreach ($row in $tableList) {
                                     source = [ordered]@{ type = "GoogleBigQuerySource" }
                                     sink   = [ordered]@{ type = "ParquetSink" }
                                 }
+                            },
+                            # Debug: Set variable with copy output
+                            [ordered]@{
+                                name = "Debug_CopyOutput_Parquet"
+                                type = "SetVariable"
+                                dependsOn = @([ordered]@{
+                                    activity = "Copy_Parquet"
+                                    dependencyConditions = @("Succeeded")
+                                })
+                                typeProperties = [ordered]@{
+                                    variableName = "debugCopyOutput"
+                                    value = "@string(activity('Copy_Parquet').output)"
+                                }
+                            },
+                            # Logging activity for Parquet
+                            [ordered]@{
+                                name = "Log_Parquet"
+                                type = "AppendVariable"
+                                dependsOn = @([ordered]@{
+                                    activity = "Debug_CopyOutput_Parquet"
+                                    dependencyConditions = @("Succeeded")
+                                })
+                                typeProperties = [ordered]@{
+                                    variableName = "logOutput"
+                                    value = "@concat('{""tableName"":""',pipeline().parameters.tableName,'""','"", ""containerName"":""',pipeline().parameters.containerName,'""','"", ""blobFileName"":""',pipeline().parameters.blobFileName,'_',formatDateTime(utcnow(),'yyyyMMddHHmmss'),'.parquet','""','"", ""outputFormat"":""',pipeline().parameters.outputFormat,'""','"", ""dataRead"":',activity('Copy_Parquet').output.dataRead,', ""copyOutput"":',string(activity('Copy_Parquet').output),'}')"
+                                }
+                            },
+                            # Write log to pipelinelogs container at root
+                            [ordered]@{
+                                name = "WriteLog_Parquet"
+                                type = "Copy"
+                                dependsOn = @([ordered]@{
+                                    activity = "Log_Parquet"
+                                    dependencyConditions = @("Succeeded")
+                                })
+                                inputs = @(
+                                    [ordered]@{
+                                        referenceName = "LogInputDataset"
+                                        type = "DatasetReference"
+                                        parameters = [ordered]@{
+                                            logContent = "@string(variables('logOutput'))"
+                                        }
+                                    }
+                                )
+                                outputs = @(
+                                    [ordered]@{
+                                        referenceName = "LogOutputDataset"
+                                        type = "DatasetReference"
+                                        parameters = [ordered]@{
+                                            logFileName = "@concat('log_',pipeline().parameters.tableName,'_',formatDateTime(utcnow(),'yyyyMMddHHmmss'),'.json')"
+                                        }
+                                    }
+                                )
+                                typeProperties = [ordered]@{
+                                    source = [ordered]@{
+                                        type = "JsonSource"
+                                    }
+                                    sink = [ordered]@{
+                                        type = "JsonSink"
+                                        storeSettings = [ordered]@{
+                                            type = "AzureBlobStorageWriteSettings"
+                                        }
+                                        formatSettings = [ordered]@{
+                                            type = "JsonWriteSettings"
+                                        }
+                                    }
+                                }
                             }
                         )
                         ifFalseActivities = @(
+                            # Debug: Set variable with source dataset and parameters
+                            [ordered]@{
+                                name = "Debug_Source_JSON"
+                                type = "SetVariable"
+                                typeProperties = [ordered]@{
+                                    variableName = "debugSource"
+                                    value = "@concat('Source dataset: ', pipeline().parameters.datasetName, ', Table: ', pipeline().parameters.tableName)"
+                                }
+                            },
                             [ordered]@{
                                 name           = "Copy_JSON"
                                 type           = "Copy"
-                                inputs         = @([ordered]@{ referenceName = "BigQueryDataset"; type = "DatasetReference"; parameters = [ordered]@{
-                                            datasetName = "@pipeline().parameters.bqDatasetId"
-                                            tableName   = "@pipeline().parameters.tableName"
-                                        }
-                                    })
+                                dependsOn      = @([ordered]@{
+                                    activity = "Debug_Source_JSON"
+                                    dependencyConditions = @("Succeeded")
+                                })
+                                inputs         = @([ordered]@{ 
+                                    referenceName = "BigQueryDataset"; 
+                                    type = "DatasetReference"; 
+                                    parameters = [ordered]@{
+                                        dataset = "@pipeline().parameters.datasetName"   # <-- Pass correct datasetName
+                                        tableName   = "@pipeline().parameters.tableName"
+                                    }
+                                })
                                 outputs        = @([ordered]@{ referenceName = "BlobSink_JSON"; type = "DatasetReference"; parameters = [ordered]@{
                                             containerName = "@pipeline().parameters.containerName"
                                             blobFileName  = "@concat(pipeline().parameters.blobFileName,'_',formatDateTime(utcnow(),'yyyyMMddHHmmss'),'.json')"
@@ -813,11 +1094,93 @@ foreach ($row in $tableList) {
                                         }
                                     }
                                 }
+                            },
+                            # Debug: Set variable with copy output
+                            [ordered]@{
+                                name = "Debug_CopyOutput_JSON"
+                                type = "SetVariable"
+                                dependsOn = @([ordered]@{
+                                    activity = "Copy_JSON"
+                                    dependencyConditions = @("Succeeded")
+                                })
+                                typeProperties = [ordered]@{
+                                    variableName = "debugCopyOutput"
+                                    value = "@string(activity('Copy_JSON').output)"
+                                }
+                            },
+                            # Logging activity for JSON
+                            [ordered]@{
+                                name = "Log_JSON"
+                                type = "AppendVariable"
+                                dependsOn = @([ordered]@{
+                                    activity = "Debug_CopyOutput_JSON"
+                                    dependencyConditions = @("Succeeded")
+                                })
+                                typeProperties = [ordered]@{
+                                    variableName = "logOutput"
+                                    value = "@concat('{""tableName"":""',pipeline().parameters.tableName,'""','"", ""containerName"":""',pipeline().parameters.containerName,'""','"", ""blobFileName"":""',pipeline().parameters.blobFileName,'_',formatDateTime(utcnow(),'yyyyMMddHHmmss'),'.json','""','"", ""outputFormat"":""',pipeline().parameters.outputFormat,'""','"", ""dataRead"":',activity('Copy_JSON').output.dataRead,', ""copyOutput"":',string(activity('Copy_JSON').output),'}')"
+                                }
+                            },
+                            # Write log to pipelinelogs container at root
+                            [ordered]@{
+                                name = "WriteLog_JSON"
+                                type = "Copy"
+                                dependsOn = @([ordered]@{
+                                    activity = "Log_JSON"
+                                    dependencyConditions = @("Succeeded")
+                                })
+                                inputs = @(
+                                    [ordered]@{
+                                        referenceName = "LogInputDataset"
+                                        type = "DatasetReference"
+                                        parameters = [ordered]@{
+                                            logContent = "@string(variables('logOutput'))"
+                                        }
+                                    }
+                                )
+                                outputs = @(
+                                    [ordered]@{
+                                        referenceName = "LogOutputDataset"
+                                        type = "DatasetReference"
+                                        parameters = [ordered]@{
+                                            logFileName = "@concat('log_',pipeline().parameters.tableName,'_',formatDateTime(utcnow(),'yyyyMMddHHmmss'),'.json')"
+                                        }
+                                    }
+                                )
+                                typeProperties = [ordered]@{
+                                    source = [ordered]@{
+                                        type = "JsonSource"
+                                    }
+                                    sink = [ordered]@{
+                                        type = "JsonSink"
+                                        storeSettings = [ordered]@{
+                                            type = "AzureBlobStorageWriteSettings"
+                                        }
+                                        formatSettings = [ordered]@{
+                                            type = "JsonWriteSettings"
+                                        }
+                                    }
+                                }
                             }
                         )
                     }
                 }
             )
+            # Add variables for debugging and logging
+            variables = [ordered]@{
+                logOutput = [ordered]@{
+                    type = "Array"
+                    defaultValue = @()
+                }
+                debugSource = [ordered]@{
+                    type = "String"
+                    defaultValue = ""
+                }
+                debugCopyOutput = [ordered]@{
+                    type = "String"
+                    defaultValue = ""
+                }
+            }
         }
     }
 
@@ -830,15 +1193,47 @@ foreach ($row in $tableList) {
 
     if ($existingChild) {
         Write-Host "Updating existing pipeline: $childName" -ForegroundColor Yellow
-        Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $childName -DefinitionFile $childTmp -Confirm:$false
+        $updateSucceeded = $false
+        try {
+            Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $childName -DefinitionFile $childTmp -Confirm:$false -Force
+            $updateSucceeded = $true
+        } catch {
+            Write-Host "Error updating pipeline $childName : $($_.Exception.Message). Retrying in 3 seconds..." -ForegroundColor Red
+            Start-Sleep -Seconds 3
+            try {
+                Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $childName -DefinitionFile $childTmp -Confirm:$false -Force
+                $updateSucceeded = $true
+            } catch {
+                Write-Host "Failed to update pipeline $childName after retry: $($_.Exception.Message)" -ForegroundColor Red
+                exit 1
+            }
+        }
     }
     else {
         Write-Host "Creating new pipeline: $childName" -ForegroundColor Green
-        Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName `
-            -DataFactoryName $DataFactoryName `
-            -Name $childName `
-            -DefinitionFile $childTmp `
-            -Verbose
+        $createSucceeded = $false
+        try {
+            Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName `
+                -DataFactoryName $DataFactoryName `
+                -Name $childName `
+                -DefinitionFile $childTmp `
+                -Verbose
+            $createSucceeded = $true
+        } catch {
+            Write-Host "Error creating pipeline $childName : $($_.Exception.Message). Retrying in 3 seconds..." -ForegroundColor Red
+            Start-Sleep -Seconds 3
+            try {
+                Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName `
+                    -DataFactoryName $DataFactoryName `
+                    -Name $childName `
+                    -DefinitionFile $childTmp `
+                    -Verbose
+                $createSucceeded = $true
+            } catch {
+                Write-Host "Failed to create pipeline $childName after retry: $($_.Exception.Message)" -ForegroundColor Red
+                exit 1
+            }
+        }
     }
 
     # add child to parent
@@ -848,9 +1243,9 @@ foreach ($row in $tableList) {
         typeProperties = [ordered]@{
             pipeline   = [ordered]@{ referenceName = $childName; type = "PipelineReference" }
             parameters = [ordered]@{
-                bqDatasetId   = $row.bqDatasetId
+                datasetName   = $row.datasetName
                 tableName     = $row.tableName
-                containerName = $row.tableName  # Use tableName as containerName if that's the intent
+                containerName = $row.containerName  # Use containerName as intended
                 blobFileName  = $row.blobFileName
                 outputFormat  = $row.outputFormat
             }
@@ -867,4 +1262,6 @@ Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName `
     -DataFactoryName $DataFactoryName `
     -Name $parent.name `
     -DefinitionFile $parentTmp `
-    -Verbose
+    -Verbose `
+    -Confirm:$false `
+    -Force
